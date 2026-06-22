@@ -2,7 +2,7 @@
 
 这是一个 Windows 桌面悬浮球，用来显示本机 Codex 的额度信息。
 
-当前版本：`v0.1.11`
+当前版本：`v0.1.12`
 
 当前版本只保留正确方案：读取本机 Codex 会话快照里的 `rate_limits`，不读取 cookie，不读取 token，不读取 `auth.json`，不调用远程额度接口，也不会把本机实时额度数据打进分享包。
 
@@ -25,6 +25,10 @@
 
 ![右键菜单](docs/assets/preview-context-menu.png)
 
+旧快照提示：
+
+![旧快照提示](docs/assets/preview-stale-snapshot.png)
+
 发现新版本时：
 
 ![更新标记](docs/assets/preview-update-badge.png)
@@ -37,6 +41,12 @@
 ### 未发布
 
 暂无。
+
+### v0.1.12 - 2026-06-22
+
+- 修复本地会话同时出现多个 `rate_limits` 快照时可能选到非 Codex 限额的问题，优先使用 `limit_id` 为 `codex` 的真实 Codex 额度快照。
+- 当额度快照超过 10 分钟没有更新时，悬浮球会标记为旧快照，并在刷新时间前显示“旧”字提示。
+- 点击“刷新”后会立即读取一次本机会话快照，并在 5 秒后重试一次，降低 Codex 刚写入新 `rate_limits` 时的等待感。
 
 ### v0.1.11 - 2026-06-16
 
@@ -71,7 +81,7 @@
 
 ## 快速启动
 
-1. 从 GitHub Release 下载 `codex-bubble-setup-v0.1.11.exe`。
+1. 从 GitHub Release 下载 `codex-bubble-setup-v0.1.12.exe`。
 2. 双击安装器完成安装；安装器会把程序放到当前用户目录，并创建桌面和开始菜单快捷方式。
 3. 通过“Codex 额度悬浮球”快捷方式启动。
 4. 如果显示“未连接”，额度和重置时间会显示为 `-`。先在这台电脑上使用 Codex 发一条消息，等待一分钟，或运行安装目录里的 `scripts/run_codex_local_usage_once.bat` 手动刷新一次。
