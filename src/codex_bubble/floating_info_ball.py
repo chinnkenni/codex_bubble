@@ -62,6 +62,10 @@ DEFAULT_TRAY_TIP = "Codex 额度悬浮球 - 双击定位"
 UPDATE_BADGE_TARGET = "__open_update__"
 UPDATE_STARTUP_DELAY_MS = 15000
 UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000
+REFRESH_INTERVAL_MS = 60000
+REFRESH_RETRY_DELAY_MS = 5000
+DAEMON_STALE_SECONDS = 90
+MAX_USAGE_SNAPSHOT_AGE_SECONDS = 10 * 60
 
 DEFAULT_CONFIG = {
     "collapsed": True,
@@ -507,29 +511,33 @@ class FloatingInfoBall:
     def load_usage_data(self):
         if not DATA_PATH.exists():
             self.config_data["data_source"] = "static"
+            self.config_data["usage_stale"] = False
             self.config_data["usage_windows"] = disconnected_usage_windows()
             self.last_refresh = datetime.now()
             return
         try:
             data = json.loads(DATA_PATH.read_text(encoding="utf-8-sig"))
+            snapshot_stale = self.is_usage_snapshot_stale(data)
             if isinstance(data.get("usage_windows"), dict):
                 self.config_data["usage_windows"] = deep_merge(
                     self.config_data.get("usage_windows", {}),
                     data["usage_windows"],
                 )
-            self.config_data["data_source"] = data.get("data_source", "file")
+            self.config_data["data_source"] = "stale" if snapshot_stale else data.get("data_source", "file")
+            self.config_data["usage_stale"] = snapshot_stale
             if not self.apply_snapshot_time(data.get("snapshot_time")):
                 self.last_refresh = datetime.fromtimestamp(DATA_PATH.stat().st_mtime)
         except Exception:
             self.config_data["data_source"] = "static"
+            self.config_data["usage_stale"] = False
             self.config_data["usage_windows"] = disconnected_usage_windows()
             self.last_refresh = datetime.now()
             LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
             LOG_PATH.write_text(traceback.format_exc(), encoding="utf-8")
 
-    def apply_snapshot_time(self, value):
+    def parse_snapshot_time(self, value):
         if not value:
-            return False
+            return None
         try:
             text = str(value)
             if text.endswith("Z"):
@@ -537,14 +545,41 @@ class FloatingInfoBall:
             snapshot = datetime.fromisoformat(text)
             if snapshot.tzinfo is not None:
                 snapshot = snapshot.astimezone().replace(tzinfo=None)
-            self.last_refresh = snapshot
-            return True
+            return snapshot
         except Exception:
+            return None
+
+    def snapshot_age_seconds(self, data):
+        recorded_age = data.get("snapshot_age_seconds")
+        if isinstance(recorded_age, (int, float)):
+            recorded_age = max(0, float(recorded_age))
+        else:
+            recorded_age = None
+        snapshot = self.parse_snapshot_time(data.get("snapshot_time"))
+        if snapshot is None:
+            return recorded_age
+        computed_age = max(0, (datetime.now() - snapshot).total_seconds())
+        if recorded_age is None:
+            return computed_age
+        return max(recorded_age, computed_age)
+
+    def is_usage_snapshot_stale(self, data):
+        if data.get("snapshot_stale") is True:
+            return True
+        age = self.snapshot_age_seconds(data)
+        return age is not None and age > MAX_USAGE_SNAPSHOT_AGE_SECONDS
+
+    def apply_snapshot_time(self, value):
+        snapshot = self.parse_snapshot_time(value)
+        if snapshot is None:
             return False
+        self.last_refresh = snapshot
+        return True
 
     def save_config(self):
         saved_config = deep_merge(DEFAULT_CONFIG, self.config_data)
         saved_config["data_source"] = "static"
+        saved_config["usage_stale"] = False
         saved_config["usage_windows"] = disconnected_usage_windows()
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
         CONFIG_PATH.write_text(
@@ -589,6 +624,18 @@ class FloatingInfoBall:
             LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
             LOG_PATH.write_text(traceback.format_exc(), encoding="utf-8")
             return False
+
+    def should_run_fetcher_before_refresh(self):
+        if not DATA_PATH.exists():
+            return True
+        try:
+            age = (datetime.now() - datetime.fromtimestamp(DATA_PATH.stat().st_mtime)).total_seconds()
+            if age > DAEMON_STALE_SECONDS:
+                return True
+            data = json.loads(DATA_PATH.read_text(encoding="utf-8-sig"))
+            return self.is_usage_snapshot_stale(data)
+        except Exception:
+            return True
 
     def save_position(self):
         self.config_data["position"] = {
@@ -720,6 +767,8 @@ class FloatingInfoBall:
         return self.canvas.create_polygon(points, smooth=True, **kwargs)
 
     def compact_refresh_time_text(self):
+        if self.config_data.get("usage_stale"):
+            return f"旧{self.last_refresh:%H:%M}"
         return f"{self.last_refresh:%H:%M}"
 
     def draw_refresh_glyph(self, x, y, color):
@@ -858,6 +907,20 @@ class FloatingInfoBall:
     def update_badge_label(self):
         return "更新"
 
+    def data_source_label(self):
+        source = self.config_data.get("data_source")
+        if source == "static":
+            return "静态"
+        if source == "stale" or self.config_data.get("usage_stale"):
+            return "旧快照"
+        return "文件"
+
+    def panel_title(self):
+        label = self.data_source_label()
+        if label == "文件":
+            return "Codex 用量"
+        return f"Codex 用量 · {label}"
+
     def draw_update_badge(self, x, y, width=44, height=22):
         colors = self.config_data["colors"]
         fill = colors.get("warning", "#FF9500")
@@ -872,10 +935,20 @@ class FloatingInfoBall:
         self.click_targets.append((x, y, x + width, y + height, UPDATE_BADGE_TARGET))
 
     def schedule_refresh(self):
+        try:
+            if self.should_run_fetcher_before_refresh():
+                self.run_fetcher_once()
+            self.refresh_from_usage_data()
+        except Exception:
+            LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            LOG_PATH.write_text(traceback.format_exc(), encoding="utf-8")
+        finally:
+            self.root.after(REFRESH_INTERVAL_MS, self.schedule_refresh)
+
+    def refresh_from_usage_data(self):
         self.load_usage_data()
         if not self.is_animating:
             self.render()
-        self.root.after(60000, self.schedule_refresh)
 
     def render(self):
         self.click_targets = []
@@ -1003,7 +1076,7 @@ class FloatingInfoBall:
         self.canvas.create_text(
             56,
             34,
-            text="Codex 用量" if self.config_data.get("data_source") != "static" else "Codex 用量 · 静态",
+            text=self.panel_title(),
             fill=colors["text"],
             font=("Microsoft YaHei UI", 9, "bold"),
             anchor="w",
@@ -1159,9 +1232,13 @@ class FloatingInfoBall:
 
     def refresh_now(self):
         self.run_fetcher_once()
-        self.load_usage_data()
-        self.render()
+        self.refresh_from_usage_data()
         self.save_position()
+        self.root.after(REFRESH_RETRY_DELAY_MS, self.refresh_after_recent_action)
+
+    def refresh_after_recent_action(self):
+        self.run_fetcher_once()
+        self.refresh_from_usage_data()
 
     def schedule_update_check(self):
         self.check_update_now(interactive=False)
@@ -1563,7 +1640,7 @@ class FloatingInfoBall:
         menu.add_command(label="检查更新", command=lambda: self.run_menu_action(self.check_update_now))
         menu.add_command(label=f"当前版本 v{read_current_version()}", state="disabled")
         menu.add_command(
-            label="数据源: " + ("静态" if self.config_data.get("data_source") == "static" else "文件"),
+            label="数据源: " + self.data_source_label(),
             state="disabled",
         )
         menu.add_command(label="前往官网", command=lambda: self.run_menu_action(self.open_project_homepage))

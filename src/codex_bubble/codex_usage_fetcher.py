@@ -14,6 +14,8 @@ LABEL_WEEKLY = "1\u5468"
 LABEL_DAY = "1\u5929"
 LABEL_MINUTE = "\u5206\u949f"
 UNKNOWN_VALUE = "-"
+PREFERRED_LIMIT_IDS = {"codex"}
+MAX_SNAPSHOT_AGE_SECONDS = 10 * 60
 
 
 def write_log(message):
@@ -131,6 +133,22 @@ def normalize_payload(payload):
     raise ValueError("Payload does not contain Codex rate-limit data.")
 
 
+def has_usage_windows(rate_limits):
+    return any(
+        isinstance(rate_limits.get(name), dict)
+        for name in ("primary", "secondary", "primary_window", "secondary_window")
+    )
+
+
+def rate_limit_preference(rate_limits):
+    limit_id = str(rate_limits.get("limit_id") or "").strip().lower()
+    if limit_id in PREFERRED_LIMIT_IDS:
+        return 0
+    if not limit_id:
+        return 1
+    return 2
+
+
 def parse_event_timestamp(value, fallback):
     if not value:
         return fallback
@@ -162,6 +180,7 @@ def iter_session_files():
 
 def latest_session_rate_limits():
     latest = None
+    latest_preference = None
     for path in iter_session_files():
         fallback_ts = path.stat().st_mtime
         try:
@@ -183,11 +202,17 @@ def latest_session_rate_limits():
                         rate_limits = payload.get("rate_limits")
                 if not isinstance(rate_limits, dict):
                     continue
-                if not (rate_limits.get("primary") or rate_limits.get("secondary")):
+                if not has_usage_windows(rate_limits):
                     continue
                 event_ts = parse_event_timestamp(event.get("timestamp"), fallback_ts)
-                if latest is None or event_ts > latest[0]:
+                preference = rate_limit_preference(rate_limits)
+                if (
+                    latest is None
+                    or preference < latest_preference
+                    or (preference == latest_preference and event_ts > latest[0])
+                ):
                     latest = (event_ts, rate_limits, str(path))
+                    latest_preference = preference
     return latest
 
 
@@ -196,8 +221,11 @@ def fetch_from_codex_sessions():
     if latest is None:
         return None
     event_ts, rate_limits, source_path = latest
+    now_ts = datetime.now(timezone.utc).timestamp()
     payload = normalize_payload({"rate_limits": rate_limits})
     payload["snapshot_time"] = datetime.fromtimestamp(event_ts, tz=timezone.utc).isoformat()
+    payload["snapshot_age_seconds"] = max(0, int(now_ts - event_ts))
+    payload["snapshot_stale"] = payload["snapshot_age_seconds"] > MAX_SNAPSHOT_AGE_SECONDS
     payload["snapshot_source"] = source_path
     return payload
 
